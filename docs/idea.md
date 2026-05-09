@@ -220,29 +220,141 @@ Memory cost: ~3× current. Likely the largest single physics gain in this docume
 
 ---
 
-## 6. Top Recommendations (if you can only do three things)
+## 6. Busy Neutrino Vertex Regions: ROI Boundary Accuracy
 
-These are ranked by **expected physics gain per unit engineering effort**.
+The prolonged-track regime is one of two distinct hard cases. The other — equally important for downstream physics — is the **busy neutrino vertex region**, where many particles emerge from a single point and overlap densely in the 2D projection.
 
-### A. Stack richer inputs (Section 4.6)
-**Engineering**: ~1 week. Modify `utils/load.py` and `utils/h5_utils.py` to read and stack 8–10 channels. Re-train.
-**Expected gain**: large on prolonged tracks (>5–10% absolute efficiency at θ_xz > 85°). The current network is starved of information.
+### 6.1 Why this regime is different
 
-### B. Combo loss BCE + Dice + clDice (Section 3.1, 3.2)
-**Engineering**: ~1 day. The Dice loss is already implemented in `dice_loss.py`; clDice is ~30 lines.
-**Expected gain**: better connectivity preservation (fewer broken tracks) and modest efficiency/purity gains across the board.
+| Aspect | Prolonged track | Busy vertex |
+|---|---|---|
+| Signal-to-noise ratio | low (the dominant problem) | high |
+| Topology | single faint line | many overlapping tracks + EM/hadronic showers |
+| Failure mode | missed signal → low **efficiency** | wrong boundaries, merged ROIs → low **purity** and instance ambiguity |
+| Local charge density | low | very high |
+| Multi-plane help | critical (the only signal) | already strong; bottleneck is 2D-projection overlap |
 
-### C. Attention U-Net + dilated bottleneck (Section 2.1, 2.2)
-**Engineering**: ~3 days. New blocks in `unet/parts.py` and `unet/model.py`.
-**Expected gain**: directly addresses the small-receptive-field weakness; expected solid improvement on prolonged tracks. If memory is a concern, also swap in depthwise separable convs (Section 1.1) — this gives a smaller and stronger network.
+In a busy vertex region the network is not starved for signal — it is overwhelmed by it. The challenge shifts from "can we see the track?" to **"are the ROI boundaries accurate enough to preserve internal topology (vertex location, shower start, kinks, particle separation)?"**
 
-### Stretch: iterative refinement (Section 2.5)
-**Engineering**: requires modifying the Wire-Cell C++ pipeline to feed DNN output back into deconvolution. Larger systems-engineering cost.
-**Expected gain**: potentially the largest physics gain because it closes the feedback loop that the current pipeline cannot.
+The current binary semantic-segmentation U-Net tends to:
+- **Merge nearby particles** into one big ROI blob, losing the 1-to-1 correspondence with truth particles.
+- **Blur internal structure** because of the aggressive 5× downsampling — fine details visible at full resolution disappear in the bottleneck.
+- **Mis-locate boundaries** because BCE rewards bulk overlap and is largely insensitive to a few-pixel boundary error, even though those few pixels matter physically.
+
+### 6.2 Boundary-aware network heads and losses
+
+Lowest-effort, highest-impact bucket. None of these require new training data.
+
+- **Auxiliary boundary-prediction head** — a second 1×1-conv output predicting the ROI *boundary* mask explicitly (truth obtained via morphological gradient on the existing mask). Boundary supervision gives the encoder a strong incentive to learn sharp transitions.
+- **Boundary-weighted BCE** — multiply the per-pixel loss by `1 + α · exp(−d²/2σ²)` where d is distance to the truth boundary; α≈3, σ≈3 px. This is Ronneberger's original U-Net trick, and it is *especially* helpful when adjacent ROIs need to be separated.
+- **Active-contour / level-set inspired loss** — penalize the curvature and length of predicted contours; encourages smooth, well-separated boundaries.
+- **Lovász-Softmax** — directly optimizes IoU; less forgiving of merged ROIs than Dice or BCE because mis-merging two truth ROIs hurts the per-instance IoU much more than it hurts the global pixel sum.
+
+### 6.3 Instance-aware segmentation
+
+The current binary mask conflates "is signal" with "is the same particle as its neighbor." For busy vertices we want **instance** information: which signal pixels belong to which particle.
+
+- **Discriminative-loss embedding head** — predict a low-dimensional embedding per pixel; trained so that pixels of the same instance cluster together and different instances are pushed apart. Post-process by mean-shift or DBSCAN clustering.
+- **Watershed / soft-watershed post-processing** — treat the network's continuous output as a height map and run seeded watershed from local maxima to split merged blobs. Cheap, no architectural change; a strong baseline.
+- **Center-point + offset (CenterMask / SOLO style)** — predict (a) a per-particle center heatmap and (b) per-pixel offsets to the nearest center. Two extra cheap heads on the existing decoder.
+- **Affinity / connectivity learning** — predict for each pixel pair (4-neighbors and longer-range) whether they belong to the same instance; reconstruct instances by graph clustering. Particularly natural for line-like tracks.
+- **Panoptic head** — combine the existing semantic mask with one of the above to produce instance IDs.
+
+The right choice depends on whether per-particle truth labels can be generated (Section 6.7).
+
+### 6.4 High-resolution preservation
+
+The U-Net's 5× downsampling discards exactly the fine internal structure that vertex regions need.
+
+- **HRNet-style parallel branches** — keep a high-resolution stream alive the whole way through, fusing with the lower-resolution branches at every stage. Substantially better at preserving fine details than encoder-decoder U-Net.
+- **Less aggressive bottleneck** — replace the deepest one or two max-pool stages with stride-1 + dilation. Same receptive field, finer feature maps.
+- **Sub-pixel / pixel-shuffle upsampling** in the decoder — sharper output than bilinear, less prone to blurring boundaries.
+- **Direct skip from the deconvolved input to the last decoder stage** — preserves the high-resolution charge information end-to-end so the final classifier sees raw detail, not just deeply-processed features.
+
+### 6.5 Input features that help in dense regions
+
+Stack of cheap pre-computed features that explicitly hint at vertex topology:
+
+- **Local charge-density map** — Gaussian-blurred loose-LF deconvolution at multiple scales (σ = 3, 10, 30 px). Highlights "vertex-like" high-density regions.
+- **Local-maxima map** — peak detection on the loose-LF image; gives the network a candidate "particle center" prior.
+- **Distance-to-nearest-peak transform** — soft instance-separating feature. Pixels equidistant from two peaks are likely on a boundary.
+- **Multi-scale Laplacian-of-Gaussian / wavelet features** — emphasize internal structure at multiple scales.
+- **Skeleton + branch-point map** — morphological skeleton with explicit branch-point annotation; the branch points are candidate vertices.
+
+These augment the rich-input stack proposed in Section 4.6 and are particularly relevant when training data includes neutrino events.
+
+### 6.6 Multi-plane reasoning for instance separation
+
+2D overlap is much less likely to also overlap in 3D. The cross-plane geometry already used for MP2/MP3 becomes even more powerful for *instance separation* in busy regions:
+
+- **3D-consistent instance grouping** — propose 3D points by ray intersection across the three planes; project back to 2D as soft instance labels. Two 2D-merged tracks with different 3D positions naturally separate.
+- **Cross-plane attention** — let the V-plane decoder attend to the U- and W-plane features at the geometrically corresponding wires. Generalizes the binary MP2/MP3 mask to a learned, continuous cross-plane reasoning module.
+- **Joint 2D + sparse 3D branch** — a parallel sparse 3D CNN consuming the (provisionally) reconstructed 3D charge cloud; pass its features back into each 2D plane's decoder. Closes the loop between 2D processing and 3D imaging.
+
+### 6.7 Truth labels for instance separation
+
+The current truth is a single binary mask. To train any of the instance-aware approaches above, we need **per-particle** labels. The Geant4 simulation already produces them — they just need to be propagated through the data pipeline.
+
+- **Per-particle Geant4 IDs** — store as a multi-channel label tensor (one channel per particle, or a single integer-ID map). Most LArTPC simulations carry this information; extracting it is a one-time data-pipeline task.
+- **Boundary masks** — derive automatically from per-particle masks via morphological gradient.
+- **Distance-to-boundary** field — useful as a regression target for the boundary-aware losses in 6.2.
+
+This is the single most impactful enabler in this section: once per-particle truth is available, the entire instance-aware section becomes tractable.
+
+### 6.8 Training-data emphasis
+
+The existing 500-event cosmic-ray training set is heavy on isolated tracks and light on busy vertices.
+
+- **Add neutrino-interaction events** to the training pool (NuMI / BNB / DUNE-style νµ-CC and νe-CC samples).
+- **Synthetic complex vertices** — Geant4 events with deliberately high multiplicity to populate the regime densely.
+- **Hard-example mining** — at each epoch, identify events where the predicted ROI count differs from the truth ROI count; over-sample them next epoch. ROI-count error is a much better proxy for vertex-region failure than pixel BCE.
+- **Spatial loss weighting** — weight loss higher where local charge density (Section 6.5) exceeds a threshold; concentrates gradient on dense regions during training.
+
+### 6.9 Evaluation tailored to busy regions
+
+Pixel-wise efficiency and purity *miss* the merge / split error mode entirely. A perfectly merged blob can have 100% pixel efficiency and high pixel purity yet be physically useless because the particles cannot be told apart.
+
+- **ROI-count error** — `|N_pred − N_truth|` per event, where N is the number of distinct connected components.
+- **Merge / split rates** — fraction of truth ROIs that share a predicted component (merge); fraction of predicted ROIs that span multiple truth particles (split).
+- **Boundary IoU** — IoU computed only on a few-pixel boundary band, not the whole mask. Dramatically more sensitive to boundary precision.
+- **Vertex-localization error** — distance from predicted vertex (e.g., density peak) to truth vertex; ties directly to downstream physics measurements (interaction-point reconstruction).
+- **Per-particle pixel efficiency** — once per-particle truth is available (Section 6.7), measure efficiency and purity per truth-particle rather than aggregated, then average. Penalizes under-segmentation properly.
+
+### 6.10 Top recommended additions for this regime
+
+Three lower-effort, higher-impact items:
+
+1. **Boundary-weighted combo loss + auxiliary boundary head** (Section 6.2) — directly attacks the merged-ROI failure mode. ~1 day of engineering. No new training data needed.
+2. **Local charge-density and local-maxima feature channels** (Section 6.5) — cheap to compute and stack alongside the existing inputs. Tells the network where the "interesting" regions are.
+3. **Watershed-style post-processing** (Section 6.3) — splits merged blobs as a post-processing step on the existing network output. Zero training cost, immediate improvement on the merge failure mode.
+
+Stretch: **per-particle truth labels + panoptic / instance head** (Sections 6.3, 6.7) — the principled long-term answer once the data pipeline supports per-particle masks.
 
 ---
 
-## 7. Evaluation Suggestions
+## 7. Top Recommendations (if you can only do three things)
+
+These are ranked by **expected physics gain per unit engineering effort**, weighted across both failure modes (prolonged tracks and busy vertices).
+
+### A. Stack richer inputs (Section 4.6 + Section 6.5)
+**Engineering**: ~1 week. Modify `utils/load.py` and `utils/h5_utils.py` to read and stack 8–12 channels including the vertex-friendly density and local-maxima features.
+**Expected gain**: large on prolonged tracks (>5–10% absolute efficiency at θ_xz > 85°) and meaningful on busy vertices. The current network is starved of information for both regimes.
+
+### B. Combo loss BCE + Dice + clDice + boundary-weighted (Sections 3.1, 3.2, 6.2)
+**Engineering**: ~1–2 days. The Dice loss is already implemented in `dice_loss.py`; clDice is ~30 lines; boundary-weighted BCE is a per-pixel weight tensor.
+**Expected gain**: better connectivity preservation (fewer broken prolonged tracks) **and** sharper, less-merged ROI boundaries (better busy-vertex purity).
+
+### C. Attention U-Net + dilated bottleneck + auxiliary boundary head (Sections 2.1, 2.2, 6.2)
+**Engineering**: ~3–4 days. New blocks in `unet/parts.py` and `unet/model.py`; one extra output head.
+**Expected gain**: addresses both the small-receptive-field weakness (prolonged tracks) and boundary precision (busy vertices). If memory is a concern, also swap in depthwise separable convs (Section 1.1) for a smaller-and-stronger network.
+
+### Stretch: iterative refinement + instance head (Sections 2.5, 6.3, 6.7)
+**Engineering**: largest. Requires C++ pipeline changes for iterative refinement and a data-pipeline change to expose per-particle Geant4 truth.
+**Expected gain**: closes the feedback loop with the deconvolution chain (largest physics gain for prolonged tracks) and enables principled instance separation in busy vertex regions.
+
+---
+
+## 8. Evaluation Suggestions
 
 When evaluating any of the above, beyond the existing pixel efficiency / pixel purity metrics:
 
