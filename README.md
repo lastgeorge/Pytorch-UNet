@@ -61,3 +61,141 @@ pth to ts
 ./to-ts.py -m pth-model/nestedunet-l23-cosmic500-e50.pth -o ts-model-2.3/nestedunet-l23-cosmic500-e50.ts -t nestedunet
 ./to-ts.py -m pth-model/unet-lt-cosmic500-e50.pth -o ts-model-2.3/unet-lt-cosmic500-e50.ts -i 2
 ```
+
+## Updated training and TorchScript conversion scripts
+
+This branch adds updated scripts for model selection, PDHD/PDVD training, and TorchScript conversion.
+
+- `train4.py`: PDHD training script with command-line DNN model selection
+- `train4_pdvd.py`: PDVD training script with command-line DNN model selection
+- `train4.sh`: interactive launcher for selecting PDHD or PDVD training
+- `to-ts4.py`: updated PyTorch checkpoint to TorchScript conversion script with MobileNetV3 and Transformer support
+
+## Training with `train4.sh`
+
+Run:
+
+```bash
+./train4.sh
+```
+
+The script asks which detector configuration to use:
+
+```bash
+1) PDHD  -> train4.py
+2) PDVD  -> train4_pdvd.py
+```
+
+Selecting `PDHD` runs `train4.py`, while selecting `PDVD` runs `train4_pdvd.py`.
+
+Training parameters can be edited directly in `train4.sh`, including:
+
+```bash
+MODELS="mobilenetv3"
+REBINS="4"
+NEPOCH=50
+TRUTH_TH=100
+PADDING=1
+MIN_RUN=2
+PADDING_SIDE="both"
+AVOID_MERGE=1
+MIN_GAP=1
+```
+
+Available DNN models are:
+
+```bash
+unet
+uresnet
+nestedunet
+mobilenetv2
+mobilenetv3
+transformer
+```
+
+For MobileNetV3, the following options are separated in `train4.sh`:
+
+```bash
+MOBILENETV3_VARIANT="large"
+MOBILENETV3_PRETRAINED=1
+```
+
+## Manual training examples
+
+PDHD example:
+
+```bash
+python train4.py --gpu \
+  --model mobilenetv3 \
+  --mobilenetv3-variant large \
+  --start-epoch 0 \
+  --nepoch 50 \
+  --start-train 0 \
+  --ntrain 90 \
+  --start-val 90 \
+  --nval 10 \
+  --learning-rate 0.1 \
+  --truth-th 100 \
+  --padding 1 \
+  --min-run 2 \
+  --padding-side both \
+  --avoid-merge \
+  --min-gap 1 \
+  --rebin 4
+```
+
+PDVD example:
+
+```bash
+python train4_pdvd.py --gpu \
+  --model mobilenetv3 \
+  --mobilenetv3-variant large \
+  --start-epoch 0 \
+  --nepoch 50 \
+  --start-train 0 \
+  --ntrain 90 \
+  --start-val 90 \
+  --nval 10 \
+  --learning-rate 0.1 \
+  --truth-th 100 \
+  --padding 1 \
+  --min-run 2 \
+  --padding-side both \
+  --avoid-merge \
+  --min-gap 1 \
+  --rebin 4
+```
+
+## Convert PyTorch checkpoint to TorchScript with `to-ts4.py`
+
+`to-ts4.py` converts a trained PyTorch checkpoint into a TorchScript model.
+
+Example for MobileNetV3:
+
+```bash
+python to-ts4.py \
+  --model chk_mobunetv3_pdvd_20260421_234631/CP37.pth \
+  --arch mobilenetv3 \
+  --mv3-variant large \
+  --mv3-pretrained \
+  --output pdvd-test-CP37_rebin5_thr100_padding1_mpth.ts
+```
+
+In this script:
+
+```bash
+--model          path to the trained checkpoint file
+--arch           model architecture, such as unet, uresnet, nestedunet, mobilenetv2, mobilenetv3, or transformer
+--mv3-variant    MobileNetV3 variant, either large or small
+--mv3-pretrained use pretrained MobileNetV3 backbone
+--output         output TorchScript file path
+```
+
+Example for Transformer U-Net:
+
+```bash
+python to-ts4.py \
+  --model chk_transformer_YYYYMMDD_HHMMSS/CP37.pth \
+  --arch transformer \
+  --output transformer-CP37.ts
+```
