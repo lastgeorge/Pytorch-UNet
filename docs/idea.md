@@ -364,3 +364,85 @@ When evaluating any of the above, beyond the existing pixel efficiency / pixel p
 - **Downstream physics impact** — track reconstruction efficiency, calorimetric resolution after the full Wire-Cell pipeline, neutrino interaction vertex resolution. The DNN is one step in a long chain; ultimate value is measured at the top of the chain.
 
 The most informative single plot for this work remains Figure 8 from the paper (efficiency/purity vs. θ_xz). Any new idea should be evaluated against that baseline.
+
+---
+
+## 9. Training I/O & File-Preprocessing Strategy
+
+The preprocessing question — offline noise injection vs. online truth labeling, compression choice, sparse-frame storage, data format — is worth examining strategically because the pipeline as written is **I/O-bound by ~90 % per sample**, and a 50-epoch run reads the same 35 GB roughly 50 times. The single training-time speedups that matter are all in this layer, not in the model.
+
+### 9.1 Why this question matters
+
+- Dataset: 59 paired files × 10 events = **590 events**, 35 GB on disk after gzip (~109 GB raw float32). 50 epochs → ~30 000 sample-loads, almost all of them re-decoding the same gzip chunks.
+- Per-sample wall time is dominated by HDF5 decompression; rebin / crop / normalize / threshold / pad together cost < 5 ms / sample.
+- Whole-dataset *post-crop* size is `(3, 1600, 1500) × float32 × 590 events` ≈ **17 GB** — **fits in RAM** on the WCGPU1 box. The current pipeline re-decodes it from disk every epoch.
+
+### 9.2 How the pipeline behaves today
+
+Concrete observations from the code:
+
+- **No PyTorch `DataLoader`.** `train4.py:228–235` builds a custom generator pipeline (`zip(get_chw_imgs(...), get_masks(...))` wrapped in a custom `batch()`). Single-threaded, runs in the main process. No `num_workers`, no `pin_memory`, no `prefetch_factor` — the GPU waits for the CPU to finish each sample's decode.
+- **File-handle leak.** `utils/h5_utils.py:12` opens `h5py.File(file, 'r')` and never closes it; relies on GC. Over an epoch this accumulates FDs and eventually triggers `OSError: Too many open files` on long runs.
+- **gzip-level-4 with tiny chunks.** `convert2.py` writes datasets via `create_dataset(..., compression="gzip")` (HDF5 default = level 4) with chunk shape `(188, 80)` (~1.5 KB / chunk). Each per-event decode therefore touches dozens of small chunks → high per-read overhead on top of decompression cost.
+- **MP2 / MP3 are dense in layout.** `frame_mp2_roi0` and `frame_mp3_roi0` are stored as ordinary `(6000, 2560) float32` arrays — *sparse in value* (~96 % zeros) but *dense in layout*. Gzip exploits the zeros, but the decoded array is full-size.
+- **Eval datasets re-read each epoch.** `train4.py:184–244` loads eval files through the same generator; no caching.
+
+### 9.3 The three specific questions, with strategic answers
+
+**A. Should noise injection (offline) and truth labeling (online) be merged into one offline step?**
+
+Recommendation: **keep them split — during research.** Optionally precompute for a frozen production run.
+
+- Truth-labeling parameters (`truth_th`, `padding`, `min_run`, `padding_side`, `avoid_merge`, `min_gap`) are exactly the knobs the team is sweeping (see [hnam_truth_labeling.md](./hnam_truth_labeling.md)). Keeping them online is a deliberate flexibility win; precomputing locks you into one label config per `convert2.py` run.
+- Online labeling is ~5 % of per-sample cost — there's no real efficiency penalty for keeping it flexible.
+- Channel-kill on the other hand uses a fixed RNG (`seed=42`) and a single augmentation strategy → correctly placed offline.
+- If/when one label config is committed to for a production training, a one-shot precompute (save the binary masks alongside the rec files) is fine. Don't bother during development.
+
+**B. Should MP2 / MP3 be "densified" before training?**
+
+They are *already* dense in layout — gzip just compresses the zeros. The real options are:
+
+- **Keep dense `float32` + gzip (current)** — works, slow to decode.
+- **Sparse storage (COO / CSR)** — ~12× smaller on disk, but adds a Python-level scatter step at load and an extra dependency. Net training-speed impact: roughly a wash, because the *limiting* frame is `frame_loose_lf0` (dense in value too, ~2× gzip ratio) — saving on MP2/MP3 doesn't move the per-event decode budget.
+- **Quantize to `uint8`** (these frames are near-binary "coincidence indicators") — halves bytes per element, slightly faster decode, minimal accuracy impact. Modest but real.
+
+So "densify" is a non-question (already dense). The real lever is *quantize MP2/MP3 to `uint8`* — small win, worth taking *after* the bigger items below.
+
+**C. What data format?**
+
+Stay on HDF5; **change the codec + add an in-RAM cache.** Specifically:
+
+- **HDF5 + gzip → HDF5 + LZ4** (`compression="lzf"`, built into h5py) or **Blosc:zstd** (via the h5py-plugin pack): ~3–5× faster decompression, files ~1.2–1.5× larger. Drop-in replacement; rerun `convert2.py`.
+- **In-RAM cache**: at 17 GB post-crop, the *entire dataset fits in RAM*. Load + decode once at training startup; epochs 2..N become zero-I/O.
+- **Other formats** (Zarr, WebDataset shards, numpy `memmap`, PyTorch `.pt`): no meaningful win at 35 GB; the bottleneck is decompression + Python-loop overhead, not the container format. Migration cost is real, benefit is not.
+
+### 9.4 Ranked improvements — where the time actually goes
+
+| Change | Effort | Expected speedup | Notes |
+| --- | --- | --- | --- |
+| **In-RAM cache** — load all events once at startup, decode-once | low | ~10–20× on epochs 2..N | 17 GB post-crop fits in RAM; first-epoch cost amortized. |
+| **PyTorch `DataLoader(num_workers=4, pin_memory=True, prefetch_factor=2)`** wrapping a `Dataset` | low (wraps existing `BatchGen` logic) | ~2–3× even without caching | Overlaps decompression with GPU step. |
+| **Fix the file-handle leak** in `load()` (`with h5py.File(...)`) | trivial | small but stability win | Otherwise FDs accumulate and long runs OSError. |
+| **Switch HDF5 codec gzip → LZ4 / Blosc:zstd** | medium (rerun `convert2.py`) | ~3× faster first-epoch decode | Files ~1.2–1.5× larger. |
+| **Quantize MP2 / MP3 to `uint8`** | medium (modify converter) | ~10 % memory + decode | Near-binary frames; minimal accuracy impact. |
+| **Precompute truth masks offline** | medium | ~5 % | Costs label-flexibility — only worth it for frozen production runs. |
+| **Migrate to Zarr / WebDataset / memmap** | high | ~no measurable gain at 35 GB | Migration cost without benefit at this scale. |
+
+### 9.5 Where the answer is "no real difference"
+
+Spelling out the negatives explicitly, because not knowing what *doesn't* matter is half the strategy:
+
+- **Dense vs sparse storage for MP2 / MP3**: gzip already exploits the zeros; sparse formats save ~12× on disk but `frame_loose_lf0` dominates per-event decode time anyway. Doesn't move the needle.
+- **HDF5 vs Zarr vs WebDataset at 35 GB**: training throughput is bound by decompression and Python-loop overhead, not the format. Migration buys nothing.
+- **Precomputed truth vs online**: ~5 % of per-sample cost. Not worth giving up the parameter-sweep flexibility.
+- **`float16` everywhere**: < 5 % throughput gain unless paired with mixed-precision training, which is a *model* optimization already covered in Section 1.2.
+
+### 9.6 Bottom line — recommended preprocessing strategy
+
+1. **First**: wrap the data loaders as a `torch.utils.data.Dataset` and use `DataLoader(num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True)`. Fix the file-handle leak in `load()` while you're there.
+2. **Second**: add an in-RAM cache (a `dict[event_id] → (img_tensor, mask_tensor)` populated lazily). The first epoch warms it; epochs 2..N become CPU/GPU-bound, not I/O-bound.
+3. **Third** (only if 1+2 aren't enough): rerun `convert2.py` with `compression="lzf"` and quantize MP2 / MP3 to `uint8`.
+4. **Don't** combine noise injection + truth labeling into one offline step. The flexibility is worth more than the ~5 % saved.
+5. **Don't** switch from HDF5 to Zarr / WebDataset / memmap at this scale — no measurable benefit; just migration cost.
+
+See [hnam_input_preprocessing.md](./hnam_input_preprocessing.md) for what `convert2.py` and `get_chw_imgs()` actually do today, and [hnam_truth_labeling.md](./hnam_truth_labeling.md) for how the online labeling is parameterized.
