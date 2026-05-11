@@ -12,6 +12,8 @@ The five topic docs each answer one of the questions sent to hnam:
 | Model architecture + how to train | [hnam_model_and_training.md](./hnam_model_and_training.md) | "What is the final model architecture?" |
 | Evaluation scripts & metrics | [hnam_evaluation.md](./hnam_evaluation.md) | "What is the evaluation code and what metrics?" |
 | TorchScript export + Wire-Cell integration | [hnam_deployment.md](./hnam_deployment.md) | "How is the model integrated into the official chain?" |
+| Train ↔ deploy tick-count compatibility | [hnam_inference_input_shape.md](./hnam_inference_input_shape.md) | "Training is 6000 ticks — what if deployment uses 8000 or 5999?" |
+| Visual quick-look at one event + data dictionary | [pdhd_data/README.md](./pdhd_data/README.md) | "What do the HDF5 files actually look like?" |
 
 ## Top-level map of `/nfs/data/1/hnam`
 
@@ -55,6 +57,8 @@ Items that the local files don't fully answer; ready to forward.
 
 ### Deployment recipe
 - The LArSoft FCL fragments under `hnam/wire-cell-hnam/pdhd-data/*/dnnroi_sp/` look like the production drop-in for PDHD. Could you confirm the exact recipe (FCL name, WC version, `.ts` model expected) that's been handed to Xuyang / production processing?
+- Was the production PDHD `.ts` exported via `torch.jit.script` or did `try_script_then_trace` fall through to `torch.jit.trace`? (Determines whether the same `.ts` can run on non-1500-tick deployment windows — see [hnam_inference_input_shape.md](./hnam_inference_input_shape.md).)
+- What `nticks` and `tick_per_slice` are set in the production `wcls-rawdigit-dnnsp.jsonnet`? Jsonnet defaults are `6000` / `10`, but the current model wants `tick_per_slice = 4` to match training `rebin=4`.
 
 ## Verification commands used to build these docs
 

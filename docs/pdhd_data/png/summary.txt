@@ -1,0 +1,16 @@
+# PDHD event inspection -- truth threshold = 100
+
+dataset                               shape    dtype    zero%     >th%        min          max       mean
+frame_loose_lf0                (2560, 6000)  float32     0.36    54.89   -23065.1      46852.6       24.7
+frame_mp2_roi0                 (2560, 6000)  float32    96.14     3.86        0.0       4000.0      154.3
+frame_mp3_roi0                 (2560, 6000)  float32    99.15     0.85        0.0       4000.0       34.0
+frame_deposplat0               (2560, 6000)  float32    96.29     1.36        0.0      46071.4       27.6
+frame_tight_lf0                (2560, 6000)  float32     0.16    43.43    -8837.1      36984.1       14.3
+frame_decon_charge0            (2560, 6000)  float32     1.39    63.55    -5758.5      49267.3       20.0
+frame_cleanup_roi0             (2560, 6000)  float32    97.43     1.94    -4637.5      52883.9       30.2
+frame_break_roi_1st0           (2560, 6000)  float32    97.56     1.84   -12538.0      52883.9       29.3
+frame_break_roi_2nd0           (2560, 6000)  float32    97.58     1.82   -12538.0      52883.9       29.2
+frame_extend_roi0              (2560, 6000)  float32    97.99     0.00        0.0         10.0        0.2
+frame_shrink_roi0              (2560, 6000)  float32    98.57     1.21    -3542.0      52896.0       28.1
+frame_gauss0                   (2560, 6000)  float32    98.18     1.43    -5193.0      50106.0       26.9
+frame_dnnsp0                   (2560, 6000)  float32    98.88     0.95   -12095.9      53034.0       10.3
