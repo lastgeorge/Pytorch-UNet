@@ -5,6 +5,7 @@ import os
 import math
 import itertools
 import json
+from glob import glob
 from datetime import datetime
 from optparse import OptionParser
 import numpy as np
@@ -70,15 +71,22 @@ def lr_exp_decay(optimizer, lr0, gamma, epoch):
         param_group['lr'] = lr
     return optimizer
 
+def extract_file_index(path):
+    name = os.path.basename(path)
+    parts = name.split('-')
+    return int(parts[3])
+
 def train_net(net,
               device,
-              im_tags = ['frame_loose_lf0', 'frame_mp2_roi0', 'frame_mp3_roi0'],
+              im_tags = None,
               # ma_tags = ['frame_ductor0'],
-              ma_tags = ['frame_deposplat0'],
+              ma_tags = None,
               rebin_factor = 10,
               truth_th = 100,
-              file_img  = [f"/nfs/data/1/hnam/train_data_PDHD_fixedbug_separateWC/modified/g4-rec-{i}_modified.h5" for i in range(60) if i!=2],
-              file_mask = [f"/nfs/data/1/hnam/train_data_PDHD_fixedbug_separateWC/modified/g4-tru-{i}_modified.h5" for i in range(60) if i!=2],
+              file_img  = None,
+              file_mask = None,
+              # file_img  = [f"/nfs/data/1/hnam/train_data_PDHD_fixedbug_separateWC/modified/g4-rec-{i}_modified.h5" for i in range(60) if i!=2],
+              # file_mask = [f"/nfs/data/1/hnam/train_data_PDHD_fixedbug_separateWC/modified/g4-tru-{i}_modified.h5" for i in range(60) if i!=2],
               sepoch=0,
               nepoch=1,
               strain=0,
@@ -121,8 +129,32 @@ def train_net(net,
     if not os.path.exists(dir_checkpoint):
         os.makedirs(dir_checkpoint)
 
+    if file_img is None or file_mask is None:
+        base_dir = "/nfs/data/1/hnam/train_data_PDVD_rate2M_window3p2"
+        # base_dir = "/nfs/data/1/hnam/train_data_PDVD_rate2M_smallmpth_window3p2"
+        crps = ["crp1", "crp2", "crp3", "crp4"]
+
+        file_img = []
+        file_mask = []
+
+        for crp in crps:
+            rec_files = sorted(
+                glob(os.path.join(base_dir, crp, f"g4-rec-{crp}-*.h5")),
+                key=extract_file_index
+            )
+            tru_files = sorted(
+                glob(os.path.join(base_dir, crp, f"g4-tru-{crp}-*.h5")),
+                key=extract_file_index
+            )
+
+            if len(rec_files) != len(tru_files):
+                raise RuntimeError(f"{crp}: reco/truth file count mismatch: {len(rec_files)} vs {len(tru_files)}")
+
+            file_img.extend(rec_files)
+            file_mask.extend(tru_files)
+
     iddataset = {}
-    event_per_file = 10
+    event_per_file = 2
     event_zero_id_offset_rec = 100
     event_zero_id_offset_tru = 0
     
@@ -163,8 +195,8 @@ def train_net(net,
     criterion = nn.BCELoss()
 
     print(f"""
-    im_tags: {im_tags}
-    ma_tags: {ma_tags}
+    im_tags: auto by CRP suffix
+    ma_tags: auto by CRP suffix
     truth_th: {truth_th}
     padding: {padding}, min_run: {min_run}, padding_side: {padding_side},
     avoid_merge: {avoid_merge}, min_gap: {min_gap}
@@ -197,23 +229,22 @@ def train_net(net,
         
         print('epoch: {} start'.format(epoch))
         print(optimizer, file=outfile_log, flush=True)
-        
         y_range_dict = {
-                1: 6000,
-                2: 3000,
-                3: 2000,
-                4: 1500,
-                5: 1200,
-                6: 1000,
-                8: 750,
-                10: 600
+            1: 6400,
+            2: 3200,
+            4: 1600,
+            5: 1280,
+            8: 800,
+            10: 640,
         }
         rebin = [1, rebin_factor]
-        y_range = [0, y_range_dict.get(rebin_factor, 600)]
+        if rebin_factor not in y_range_dict:
+            raise ValueError(f"Unsupported rebin_factor: {rebin_factor}. Allowed: {sorted(y_range_dict.keys())}")
+        y_range = [0, y_range_dict[rebin_factor]]
 
         #x_range = [0, 800] # PDHD, U, left-closed right-open interval
         #x_range = [800, 1600] # PDHD, V, left-closed right-open interval
-        x_range = [0, 1600] # PDHD, Induction, left-closed right-open interval
+        x_range = [0, 952] # PDVD, Induction, left-closed right-open interval
         # x_range = [476, 952] # PDVD, V
         z_scale = 4000
         
@@ -225,21 +256,26 @@ def train_net(net,
         print('Starting epoch {}/{}.'.format(epoch, nepoch))
         net.train()
 
+        perm = np.random.permutation(len(iddataset['train_rec']))
+        train_rec_ids = [iddataset['train_rec'][k] for k in perm]
+        train_tru_ids = [iddataset['train_tru'][k] for k in perm]
+
         train = zip(
-          h5u.get_chw_imgs(file_img, iddataset['train_rec'], im_tags, rebin, x_range, y_range, z_scale),
-          h5u.get_masks(file_mask,   iddataset['train_tru'], ma_tags, rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
+          h5u.get_chw_imgs_pdvd(file_img, train_rec_ids, rebin, x_range, y_range, z_scale),
+          h5u.get_masks_pdvd(file_mask,   train_tru_ids, rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
         )
+
         val = zip(
-          h5u.get_chw_imgs(file_img, iddataset['val_rec'],   im_tags, rebin, x_range, y_range, z_scale),
-          h5u.get_masks(file_mask,   iddataset['val_tru'],   ma_tags, rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
+          h5u.get_chw_imgs_pdvd(file_img, iddataset['val_rec'], rebin, x_range, y_range, z_scale),
+          h5u.get_masks_pdvd(file_mask,   iddataset['val_tru'], rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
         )
         eval_data = []
         for i in range(len(eval_imgs)):
             id_eval = [0]
             eval_data.append(
                 zip(
-                    h5u.get_chw_imgs(eval_imgs[i], id_eval,   im_tags, rebin, x_range, y_range, z_scale),
-                    h5u.get_masks(eval_masks[i],   id_eval,   ma_tags, rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
+                    h5u.get_chw_imgs_pdvd(eval_imgs[i], id_eval, rebin, x_range, y_range, z_scale),
+                    h5u.get_masks_pdvd(eval_masks[i],   id_eval, rebin, x_range, y_range, truth_th, padding, min_run, padding_side, avoid_merge, min_gap)
                 )
             )
 
@@ -377,15 +413,25 @@ if __name__ == '__main__':
     torch.set_num_threads(1)
 
     # im_tags = ['frame_tight_lf0', 'frame_loose_lf0'] #lt
-    im_tags = ['frame_loose_lf0', 'frame_mp2_roi0', 'frame_mp3_roi0']    # l23
-    # im_tags = ['frame_loose_lf0', 'frame_tight_lf0', 'frame_mp2_roi0', 'frame_mp3_roi0']    # lt23
+    # im_tags = ['frame_loose_lf0', 'frame_mp2_roi0', 'frame_mp3_roi0']    # l23
+    #im_tags = ['frame_loose_lf0', 'frame_tight_lf0', 'frame_mp2_roi0', 'frame_mp3_roi0']    # lt23
     # ma_tags = ['frame_ductor0']
-    ma_tags = ['frame_deposplat0']
+    #ma_tags = ['frame_deposplat0']
+
+    # PDVD uses automatic CRP-dependent image/mask loading.
+    # Therefore im_tags and ma_tags are not used directly.
+    im_tags = None
+    ma_tags = None
+
+    # Set the number of input/output channels explicitly for PDVD.
+    # Change n_channels if get_chw_imgs_pdvd returns a different number of channels.
+    n_channels = 3
+    n_classes = 1
 
     net = build_model(
         model_name=args.model,
-        n_channels=len(im_tags),
-        n_classes=len(ma_tags),
+        n_channels=n_channels,
+        n_classes=n_classes,
         mobilenetv3_variant=args.mobilenetv3_variant,
         pretrained=args.pretrained
     )
